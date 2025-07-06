@@ -12,6 +12,8 @@ function App() {
   const [isLoadingVideos, setIsLoadingVideos] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [showStreamPreview, setShowStreamPreview] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
 
   // Cloudflare Stream account details from environment variables
   const customerCode = process.env.REACT_APP_CLOUDFLARE_CUSTOMER_CODE;
@@ -44,6 +46,7 @@ function App() {
       streamRef.current = stream;
       setCameraActive(true);
       setPermissionsGranted(true);
+      setShowStreamPreview(true); // Show the preview when stream starts
     } catch (err) {
       console.error('Error accessing webcam or microphone:', err);
       setUploadStatus('Error: Camera or microphone access denied');
@@ -97,6 +100,7 @@ function App() {
     
     // Update state
     setCameraActive(false);
+    setShowStreamPreview(false); // Hide the preview when camera is stopped
     console.log('Camera shutdown complete');
   };
 
@@ -131,6 +135,13 @@ function App() {
     
     document.body.appendChild(script);
     
+    // Log environment variables (without exposing sensitive data)
+    console.log('Cloudflare config check:',
+      'Customer code available:', !!customerCode,
+      'Account ID available:', !!accountId,
+      'API token available:', !!apiToken
+    );
+    
     // Check video status periodically if we have an uploaded video
     let statusCheckInterval;
     if (uploadedVideoId) {
@@ -139,6 +150,12 @@ function App() {
       
       statusCheckInterval = setInterval(async () => {
         try {
+          if (!accountId || !apiToken) {
+            console.error('Missing Cloudflare API credentials for status check');
+            clearInterval(statusCheckInterval);
+            return;
+          }
+          
           const response = await fetch(
             `https://api.cloudflare.com/client/v4/accounts/${accountId}/stream/${uploadedVideoId}`,
             {
@@ -149,6 +166,12 @@ function App() {
               }
             }
           );
+          
+          if (!response.ok) {
+            console.error('HTTP error checking video status:', response.status, response.statusText);
+            setUploadStatus(`Error checking video status: HTTP ${response.status}`);
+            return;
+          }
           
           const data = await response.json();
           if (data.success && data.result.status.state === 'ready') {
@@ -161,9 +184,13 @@ function App() {
           } else if (data.success) {
             console.log('Video processing status:', data.result.status);
             setUploadStatus(`Video processing: ${data.result.status.state}`);
+          } else {
+            console.error('API reported error during status check:', data.errors);
+            setUploadStatus(`Error checking video: ${data.errors && data.errors[0] ? data.errors[0].message : 'Unknown error'}`);
           }
         } catch (error) {
           console.error('Error checking video status:', error);
+          setUploadStatus(`Error checking video: ${error.message || 'Network error'}`);
         }
       }, 5000); // Check every 5 seconds
     }
@@ -176,7 +203,7 @@ function App() {
         clearInterval(statusCheckInterval);
       }
     };
-  }, [uploadedVideoId, accountId, apiToken]);
+  }, [uploadedVideoId, accountId, apiToken, customerCode]);
   
   // Initialize players for uploaded videos
   const initializePlayer = (playerElement, videoId) => {
@@ -205,7 +232,7 @@ function App() {
     }
   };
 
-  // Fetch previously uploaded videos from Cloudflare Stream
+  // Fetch previously uploaded precious videos from Cloudflare Stream
   const fetchPreviousVideos = async () => {
     setIsLoadingVideos(true);
     try {
@@ -225,9 +252,10 @@ function App() {
       console.log('API response:', data);
       
       if (data.success) {
-        // Filter to only include videos that are ready to play
+        // Filter to include all videos that are ready to play
         const readyVideos = data.result.filter(video => 
-          video.status && video.status.state === 'ready'
+          video.status && 
+          video.status.state === 'ready'
         );
         
         setPreviousVideos(readyVideos);
@@ -261,7 +289,18 @@ function App() {
     }
     
     chunksRef.current = [];
-    const mediaRecorder = new MediaRecorder(streamRef.current);
+    // Add MIME options for better compatibility
+    const options = { mimeType: 'video/webm;codecs=vp9,opus' };
+    
+    let mediaRecorder;
+    try {
+      // Try with the preferred mime type
+      mediaRecorder = new MediaRecorder(streamRef.current, options);
+    } catch (e) {
+      // Fall back to browser default if preferred option isn't supported
+      console.warn('MediaRecorder with specified options not supported, using default', e);
+      mediaRecorder = new MediaRecorder(streamRef.current);
+    }
     
     mediaRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
@@ -272,20 +311,36 @@ function App() {
     mediaRecorder.onstop = () => {
       const blob = new Blob(chunksRef.current, { type: 'video/webm' });
       setVideoBlob(blob);
+      console.log('Recording stopped. Blob created:', blob);
       
       // Create a URL for the blob to preview
       const videoURL = URL.createObjectURL(blob);
-      videoPreviewRef.current.srcObject = null;
-      videoPreviewRef.current.src = videoURL;
-      videoPreviewRef.current.controls = true;
+      if (videoPreviewRef.current) {
+        videoPreviewRef.current.srcObject = null;
+        videoPreviewRef.current.src = videoURL;
+        videoPreviewRef.current.controls = true;
+        
+        // Ensure the video plays
+        videoPreviewRef.current.onloadedmetadata = () => {
+          videoPreviewRef.current.play().catch(e => {
+            console.warn('Auto-play prevented:', e);
+          });
+        };
+      }
       
       setUploadStatus('Recording complete. Ready to upload.');
     };
     
-    mediaRecorder.start();
+    // Request data at regular intervals to ensure we capture content
+    mediaRecorder.start(1000); // Get data every second
     mediaRecorderRef.current = mediaRecorder;
     setRecording(true);
     setUploadStatus('Recording in progress...');
+    
+    // Important: Keep the live preview visible during recording
+    if (videoPreviewRef.current) {
+      videoPreviewRef.current.srcObject = streamRef.current;
+    }
   };
 
   // Stop recording
@@ -301,16 +356,37 @@ function App() {
 
   // Upload the recorded video to Cloudflare Stream
   const uploadToCloudflare = async () => {
-    if (!videoBlob) return;
+    if (!videoBlob) {
+      console.error('No video blob available for upload');
+      setUploadStatus('Error: No video available to upload');
+      return;
+    }
+    
+    // Check if the API credentials are available
+    if (!accountId || !apiToken) {
+      console.error('Missing Cloudflare API credentials');
+      setUploadStatus('Error: Missing API credentials. Check your .env file.');
+      return;
+    }
     
     setUploadStatus('Uploading to Cloudflare...');
     setIsProcessing(true); // Start processing indicator during upload
     
     try {
+      console.log('Preparing video for upload, size:', videoBlob.size);
+      
       // Create a FormData object to send the video file
       const formData = new FormData();
-      formData.append('file', videoBlob, 'recorded-video.webm');
       
+      // Create a file from the blob with proper extension and type
+      const videoFile = new File([videoBlob], 'recorded-video.webm', { 
+        type: 'video/webm',
+        lastModified: new Date().getTime() 
+      });
+      
+      formData.append('file', videoFile);
+      
+      console.log('Uploading to Cloudflare Stream API...');
       // Upload the video to Cloudflare Stream
       const response = await fetch(
         `https://api.cloudflare.com/client/v4/accounts/${accountId}/stream`,
@@ -323,7 +399,15 @@ function App() {
         }
       );
       
+      if (!response.ok) {
+        console.error('HTTP error during upload:', response.status, response.statusText);
+        setUploadStatus(`Upload failed: HTTP ${response.status} ${response.statusText}`);
+        setIsProcessing(false);
+        return;
+      }
+      
       const data = await response.json();
+      console.log('Upload response:', data);
       
       if (data.success) {
         setUploadStatus('Upload successful! Processing video...');
@@ -331,11 +415,14 @@ function App() {
         console.log('Uploaded video ID:', data.result.uid);
         // Note: We keep processing true until the periodic check detects the video is ready
       } else {
-        setUploadStatus(`Upload failed: ${data.errors[0].message}`);
+        console.error('API reported error:', data.errors);
+        setUploadStatus(`Upload failed: ${data.errors && data.errors[0] ? data.errors[0].message : 'Unknown error'}`);
+        setIsProcessing(false);
       }
     } catch (error) {
       console.error('Error uploading video:', error);
-      setUploadStatus(`Error: ${error.message}`);
+      setUploadStatus(`Error: ${error.message || 'Unknown upload error'}`);
+      setIsProcessing(false);
     }
   };
   
@@ -360,82 +447,235 @@ function App() {
     const options = { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
     return new Date(dateString).toLocaleDateString(undefined, options);
   };
-
+  
   return (
     <div className="App">
-      <header className="App-header">
-        <h1>Webcam Recorder & Cloudflare Stream</h1>
-      </header>
+      {/* Sidebar similar to Spotify */}
+      <aside className="sidebar">
+        <div className="sidebar-logo">
+          <img src="/logo.png" alt="Stream Logo" />
+        </div>
+        <nav className="nav-menu">
+          <a href="#" className="nav-item active p-20">
+            <img src="/stream.svg" alt="Stream Logo" />
+            <span>Streams</span>
+          </a>
+          <a href="#" className="nav-item">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M19.376 12.416L8.777 19.482A.5.5 0 0 1 8 19.066V4.934a.5.5 0 0 1 .777-.416l10.599 7.066a.5.5 0 0 1 0 .832z" fill="currentColor"/>
+            </svg>
+            <span>Videos</span>
+          </a>
+          <a href="#" className="nav-item">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm0 2v12h16V6H4zm2 3h2v6H6V9zm3 0h2v6H9V9zm3 0h2v6h-2V9zm3 0h2v6h-2V9z" fill="currentColor"/>
+            </svg>
+            <span>Shorts</span>
+          </a>
+          <a href="#" className="nav-item">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M3 3h8v8H3V3zm0 10h8v8H3v-8zm10-10h8v8h-8V3zm0 10h8v8h-8v-8z" fill="currentColor"/>
+            </svg>
+            <span>Categories</span>
+          </a>
+          <a href="#" className="nav-item">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M10 8v8l6-4-6-4z" fill="currentColor"/>
+            </svg>
+            <span>Videos</span>
+          </a>
+          <a href="#" className="nav-item">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm0 2v12h16V6H4zm2 3h2v6H6V9zm3 0h2v6H9V9zm3 0h2v6h-2V9zm3 0h2v6h-2V9z" fill="currentColor"/>
+            </svg>
+            <span>Shorts</span>
+          </a>
+          <a href="#" className="nav-item">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M3 3h8v8H3V3zm0 10h8v8H3v-8zm10-10h8v8h-8V3zm0 10h8v8h-8v-8z" fill="currentColor"/>
+            </svg>
+            <span>Categories</span>
+          </a>
+        </nav>
+        
+        <hr className="nav-divider" />
+        
+        <div className="nav-menu">
+          <div className="nav-item">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12.5 3.247a1 1 0 0 0-1 0L4 7.577V20h4.5v-6a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v6H20V7.577l-7.5-4.33zm-2-1.732a3 3 0 0 1 3 0l7.5 4.33a2 2 0 0 1 1 1.732V21a1 1 0 0 1-1 1h-6.5a1 1 0 0 1-1-1v-6h-3v6a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V7.577a2 2 0 0 1 1-1.732l7.5-4.33z" fill="currentColor"/>
+            </svg>
+            <span>Your Recordings</span>
+          </div>
+          <div className="nav-item">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M13 2.5V6h3.5a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5H13v3.5a.5.5 0 0 1-.5.5h-1a.5.5 0 0 1-.5-.5V8H7.5a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5H11V2.5a.5.5 0 0 1 .5-.5h1a.5.5 0 0 1 .5.5z" fill="currentColor"/>
+              <path d="M2 13.692V16a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2.308A24.974 24.974 0 0 1 12 18a24.98 24.98 0 0 1-10-4.308z" fill="currentColor"/>
+            </svg>
+            <span>Create Recording</span>
+          </div>
+        </div>
+      </aside>
       
-      <main>
-        <div className="webcam-container">
-          <h2>Webcam {cameraActive && <span className="camera-active">● LIVE</span>}</h2>
-          <video 
-            ref={videoPreviewRef} 
-            autoPlay 
-            playsInline
-            muted={cameraActive} // Only mute when showing live camera
-            className="webcam-preview"
-          />
+      {/* Main content area */}
+      <main className="main-content">
+        {/* App header with navigation controls */}
+        <div className="app-header">
+          {/* <div className="navigation-controls">
+            <button className="nav-button">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M15.957 2.793a1 1 0 010 1.414L8.164 12l7.793 7.793a1 1 0 11-1.414 1.414L5.336 12l9.207-9.207a1 1 0 011.414 0z" fill="currentColor"/>
+              </svg>
+            </button>
+            <button className="nav-button">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M8.043 2.793a1 1 0 000 1.414L15.836 12l-7.793 7.793a1 1 0 101.414 1.414L18.664 12 9.457 2.793a1 1 0 00-1.414 0z" fill="currentColor"/>
+              </svg>
+            </button>
+          </div> */}
           
-          <div className="button-container">
-            {!recording && !videoBlob && !cameraActive && (
+          <div className="user-controls align-right justify-content-end">
+            {!cameraActive && (
               <button 
                 onClick={setupCamera} 
-                className="camera-btn"
+                className="primary-btn camera-btn start-stream-btn"
               >
-                Start Camera
+                <svg width="16" height="16" style={{ marginRight: '8px' }} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M15.2 2.4h-2.4V0h-1.6v2.4H8.8v1.6h2.4V6.4h1.6V4h2.4V2.4z" fill="currentColor"/>
+                  <path d="M8 8.8c1.767 0 3.2-1.433 3.2-3.2S9.767 2.4 8 2.4 4.8 3.833 4.8 5.6 6.233 8.8 8 8.8z" fill="currentColor"/>
+                  <path d="M12 9.6H4c-1.983 0-3.6 1.617-3.6 3.6v2.4h15.2v-2.4c0-1.983-1.617-3.6-3.6-3.6z" fill="currentColor"/>
+                </svg>
+                Start Live Stream
               </button>
             )}
             
-            {!recording && !videoBlob && cameraActive && (
+            {isLoggedIn ? (
+              <div className="user-profile">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.341 13.409A3.998 3.998 0 008 11a3.998 3.998 0 00-3.341 2.409A6.977 6.977 0 018 14c1.074 0 2.089-.245 3.341-.591zM6.5 7a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zm5.82 4.993A5.962 5.962 0 0013 8c0-3.308-2.692-6-6-6S1 4.692 1 8c0 1.495.544 2.867 1.44 3.92a5.968 5.968 0 015.055-2.87 5.971 5.971 0 014.825 2.943z" fill="currentColor"/>
+                </svg>
+              </div>
+            ) : (
               <button 
-                onClick={startRecording} 
-                disabled={!permissionsGranted}
-                className="record-btn"
+                className="login-button" 
+                onClick={() => setIsLoggedIn(true)}
               >
-                Start Recording
-              </button>
-            )}
-            
-            {recording && (
-              <button 
-                onClick={stopRecording} 
-                className="stop-btn"
-              >
-                Stop Recording
-              </button>
-            )}
-            
-            {videoBlob && (
-              <>
-                <button 
-                  onClick={uploadToCloudflare} 
-                  className="upload-btn"
-                >
-                  Upload to Cloudflare
-                </button>
-                
-                <button 
-                  onClick={resetRecording} 
-                  className="reset-btn"
-                >
-                  Record Again
-                </button>
-              </>
-            )}
-            
-            {cameraActive && !recording && (
-              <button 
-                onClick={stopCamera} 
-                className="stop-camera-btn"
-              >
-                Turn Off Camera
+                Login
               </button>
             )}
           </div>
+        </div>
+        {/* Stream Preview Modal */}
+        {showStreamPreview && (
+          <div className="stream-preview-modal">
+            <div className="stream-preview-content">
+              <div className="modal-header">
+                <h2>Live Stream Preview</h2>
+                <button className="close-btn" onClick={() => setShowStreamPreview(false)}>
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M12.5 3.5l-9 9m0-9l9 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </button>
+              </div>
+              
+              <video 
+                ref={videoPreviewRef} 
+                autoPlay 
+                playsInline
+                muted={cameraActive} // Only mute when showing live camera
+                className="webcam-preview-modal"
+              />
+              
+              <div className="button-container">
+                {!recording && !videoBlob && cameraActive && (
+                  <button 
+                    onClick={startRecording} 
+                    disabled={!permissionsGranted}
+                    className="primary-btn record-btn"
+                  >
+                    <img 
+                      src={`${process.env.PUBLIC_URL}/record.svg`} 
+                      alt="Record" 
+                      style={{ 
+                        marginRight: '8px', 
+                        width: '16px', 
+                        height: '16px',
+                        filter: 'none'
+                      }} 
+                    />
+                    Start Recording
+                  </button>
+                )}
+                
+                {recording && (
+                  <button 
+                    onClick={stopRecording} 
+                    className="secondary-btn stop-btn"
+                  >
+                    <img 
+                      src={`${process.env.PUBLIC_URL}/record.svg`} 
+                      alt="Stop Recording" 
+                      style={{ 
+                        marginRight: '8px', 
+                        width: '16px', 
+                        height: '16px',
+                        filter: 'invert(21%) sepia(100%) saturate(7414%) hue-rotate(0deg) brightness(94%) contrast(117%)' // Makes the icon red
+                      }} 
+                    />
+                    Stop Recording
+                  </button>
+                )}
+                
+                {cameraActive && !recording && (
+                  <button 
+                    onClick={stopCamera} 
+                    className="secondary-btn stop-camera-btn"
+                  >
+                    <svg width="16" height="16" style={{ marginRight: '8px' }} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <path d="M2.5 2.5l11 11m-11 0l11-11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                    </svg>
+                    Turn Off Camera
+                  </button>
+                )}
+              </div>
+              
+              {uploadStatus && (
+                <div className="status-container">
+                  <p>{uploadStatus}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        
+        {/* Webcam container for non-modal video preview and controls */}
+        <div className="webcam-container">
+          {videoBlob && (
+            <div className="button-container">
+              <button 
+                onClick={uploadToCloudflare} 
+                className="primary-btn upload-btn"
+              >
+                <svg width="16" height="16" style={{ marginRight: '8px' }} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M7.5 1.5l3.5 3.5m-3.5-3.5v9m-3.5-5.5l3.5-3.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  <path d="M2.5 10v2.5a1 1 0 001 1h9a1 1 0 001-1V10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                </svg>
+                Upload to Cloud
+              </button>
+              
+              <button 
+                onClick={resetRecording} 
+                className="secondary-btn reset-btn"
+              >
+                <svg width="16" height="16" style={{ marginRight: '8px' }} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M13.5 2.5L12 1 10.5 2.5M12 1v4.5M4.5 4C3.12 4 2 5.12 2 6.5v6C2 13.88 3.12 15 4.5 15h6c1.38 0 2.5-1.12 2.5-2.5V10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+                Record Again
+              </button>
+            </div>
+          )}
           
-          {uploadStatus && (
+          {uploadStatus && !showStreamPreview && (
             <div className="status-container">
               <p>{uploadStatus}</p>
             </div>
@@ -499,44 +739,54 @@ function App() {
           </div>
         )}
         
-        <div className="previous-videos-container">
-          <h2>Previous Recordings</h2>
-          {isLoadingVideos ? (
-            <p>Loading videos...</p>
-          ) : previousVideos.length > 0 ? (
-            <div className="videos-grid">
-              {previousVideos.map(video => (
-                <div key={video.uid} className="video-card">
-                  <h3>{video.meta?.name || 'Untitled Video'}</h3>
-                  <div className="iframe-container">
-                    {/* These videos should be ready to play since we filtered for ready status */}
-                    <iframe
-                      src={`https://${customerCode}/${video.uid}/iframe`}
-                      style={{ border: 'none' }}
-                      height="360"
-                      width="640"
-                      allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;"
-                      allowFullScreen={true}
-                      className="stream-player"
-                      ref={el => {
-                        if (el) {
-                          // Initialize player once the iframe is loaded
-                          el.onload = () => initializePlayer(el, video.uid);
-                        }
-                      }}
-                      onError={(e) => console.error(`Iframe loading error for video ${video.uid}:`, e)}
-                    ></iframe>
+        {/* Precious streams section */}
+        <h2 className="videos-section-title">Precious Streams</h2>
+        
+        {isLoadingVideos ? (
+          <div className="loading-container">
+            <div className="spinner"></div>
+            <p>Loading your recordings...</p>
+          </div>
+        ) : previousVideos.length > 0 ? (
+          <div className="videos-grid">
+            {previousVideos.map(video => (
+              <div key={video.uid} className="video-card">
+                <div className="video-thumbnail">
+                  {/* These videos should be ready to play since we filtered for ready status */}
+                  <iframe
+                    src={`https://${customerCode}/${video.uid}/iframe`}
+                    style={{ border: 'none' }}
+                    allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;"
+                    allowFullScreen={true}
+                    className="stream-player"
+                    ref={el => {
+                      if (el) {
+                        // Initialize player once the iframe is loaded
+                        el.onload = () => initializePlayer(el, video.uid);
+                      }
+                    }}
+                    onError={(e) => console.error(`Iframe loading error for video ${video.uid}:`, e)}
+                  ></iframe>
+                  <div className="play-button">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <path d="M7.05 3.606l13.49 7.788a.7.7 0 010 1.212L7.05 20.394A.7.7 0 016 19.788V4.212a.7.7 0 011.05-.606z" fill="currentColor"/>
+                    </svg>
                   </div>
+                </div>
+                <div className="video-info">
+                  <h3>{video.meta?.name || 'Untitled Video'}</h3>
                   <p className="video-date">
-                    Recorded: {formatDate(video.created)}
+                    {formatDate(video.created)}
                   </p>
                 </div>
-              ))}
-            </div>
-          ) : (
-            <p>No previous recordings found.</p>
-          )}
-        </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state">
+            <p>No precious streams found. Start recording and mark your streams as precious to see them here.</p>
+          </div>
+        )}
       </main>
     </div>
   );
