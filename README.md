@@ -1,4 +1,33 @@
-# Getting Started with Create React App
+# Webcam Recorder with Cloudflare Stream
+
+A React-based webcam video recording application that allows you to record video from your webcam, preview the recordings, upload them to Cloudflare Stream, and view previously uploaded videos.
+
+## Features
+
+- Live webcam preview with camera controls
+- Video recording with MediaRecorder API
+- Direct upload to Cloudflare Stream
+- View previously uploaded videos from Cloudflare Stream
+- Processing indicator with status updates
+- Proper camera shutdown when not in use
+
+## Setup
+
+1. Clone this repository
+2. Create a `.env` file in the root directory with the following variables:
+```
+REACT_APP_CLOUDFLARE_CUSTOMER_CODE=your-customer-code.cloudflarestream.com
+REACT_APP_CLOUDFLARE_ACCOUNT_ID=your-account-id
+REACT_APP_CLOUDFLARE_API_TOKEN=your-api-token
+```
+3. Install dependencies with `npm install`
+4. Run the app with `npm start`
+
+## Cloudflare Stream Setup
+
+You need a Cloudflare Stream account to use this application. Get your credentials from the Cloudflare dashboard.
+
+---
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
 
