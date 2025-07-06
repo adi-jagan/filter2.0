@@ -1,5 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
 import './App.css';
+// NewRelic is not supported in browser environments
+// import 'newrelic';  
+
+// Conditionally load NewRelic only in Node.js environments
+if (typeof window === 'undefined') {
+  require('newrelic');
+}
 
 function App() {
   // State variables
